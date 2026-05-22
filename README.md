@@ -1,8 +1,8 @@
 # TelePrompt
 
-Free online teleprompter with real-time voice tracking. Auto-scroll follows your pace, highlights text as you read.
+[English](./README.md) | [中文](./README_CN.md)
 
-免费的在线提词器，支持实时语音跟踪。自动滚动跟随你的语速，朗读时高亮显示文字。
+Free online teleprompter with real-time voice tracking. Auto-scroll follows your pace, highlights text as you read.
 
 ## Features
 
@@ -50,4 +50,4 @@ Speech recognition requires a Chromium-based browser (Chrome, Edge, Opera). Othe
 
 ## License
 
-MIT
+[MIT](./LICENSE)
