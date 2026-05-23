@@ -573,6 +573,7 @@ export function findMatchPosition(
   if (!candidates.length || !fullText) return startFrom;
 
   const { normFull, origMap } = getTextCache(fullText);
+
   if (!normFull) return startFrom;
 
   // ── Locate current position in normalized space (binary search, O(log n)) ──

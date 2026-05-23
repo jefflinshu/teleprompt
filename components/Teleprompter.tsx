@@ -17,6 +17,11 @@ import {
   AudioLines,
   Gauge,
   ChevronDown,
+  SkipBack,
+  SkipForward,
+  Download,
+  Timer,
+  Clock,
 } from "lucide-react";
 import { Slider } from "@/components/ui/slider";
 import { useTeleprompterStore } from "@/lib/store";
@@ -26,39 +31,98 @@ import {
   findMatchPosition,
 } from "@/hooks/use-speech-recognition";
 import { cn } from "@/lib/utils";
+import { formatTimer, toEditJSON, hasRewinds, downloadFile } from "@/lib/export-utils";
 import { t, detectSpeechLang } from "@/lib/i18n";
 
 // ── Text Display ────────────────────────────────────────────────
 // Renders as TWO spans only: already-read portion + remaining.
 // This avoids creating thousands of individual DOM nodes (one per char),
 // which caused React to be extremely slow when updating highlight position.
+// Now also supports a click handler for repositioning.
 function TextDisplay({
   text,
   recognizedUpTo,
   textColor,
   highlightColor,
   highlightRef,
+  onClickPosition,
 }: {
   text: string;
   recognizedUpTo: number;
   textColor: string;
   highlightColor: string;
   highlightRef?: React.RefObject<HTMLSpanElement | null>;
+  onClickPosition?: (charIndex: number) => void;
 }) {
+  const containerRef = useRef<HTMLDivElement>(null);
+
+  // Click handler: determine which character was clicked via Range API
+  const handleClick = useCallback((e: React.MouseEvent) => {
+    if (!onClickPosition || !containerRef.current) return;
+    const x = e.clientX;
+    const y = e.clientY;
+
+    // Use caretPositionFromPoint (standard) or caretRangeFromPoint (webkit)
+    let offset = -1;
+    if (document.caretPositionFromPoint) {
+      const pos = document.caretPositionFromPoint(x, y);
+      if (pos?.offsetNode) {
+        offset = getAbsoluteOffset(containerRef.current, pos.offsetNode, pos.offset);
+      }
+    } else if (document.caretRangeFromPoint) {
+      const range = document.caretRangeFromPoint(x, y);
+      if (range) {
+        offset = getAbsoluteOffset(containerRef.current, range.startContainer, range.startOffset);
+      }
+    }
+
+    if (offset >= 0 && offset <= text.length) {
+      onClickPosition(offset);
+    }
+  }, [onClickPosition, text.length]);
+
   const cutoff = Math.max(0, Math.min(recognizedUpTo, text.length));
+
   if (cutoff <= 0) {
-    return <span style={{ color: textColor }}>{text}</span>;
+    return (
+      <div
+        ref={containerRef}
+        onClick={handleClick}
+        style={{ cursor: onClickPosition ? "pointer" : undefined }}
+      >
+        <span style={{ color: textColor }}>{text}</span>
+      </div>
+    );
   }
   return (
-    <>
+    <div
+      ref={containerRef}
+      onClick={handleClick}
+      style={{ cursor: onClickPosition ? "pointer" : undefined }}
+    >
       <span style={{ color: highlightColor, transition: "color 0.4s" }}>
         {text.slice(0, cutoff)}
       </span>
       <span ref={highlightRef} style={{ color: textColor }}>
         {text.slice(cutoff)}
       </span>
-    </>
+    </div>
   );
+}
+
+/** Walk DOM text nodes to compute absolute character offset from a container */
+function getAbsoluteOffset(container: Node, targetNode: Node, nodeOffset: number): number {
+  let offset = 0;
+  const walker = document.createTreeWalker(container, NodeFilter.SHOW_TEXT);
+  let node = walker.nextNode();
+  while (node) {
+    if (node === targetNode) {
+      return offset + nodeOffset;
+    }
+    offset += (node.textContent?.length ?? 0);
+    node = walker.nextNode();
+  }
+  return -1;
 }
 
 // ── Mode Toggle ─────────────────────────────────────────────────
@@ -148,6 +212,9 @@ export function Teleprompter() {
     isPlaying, setIsPlaying, togglePlaying,
     isTeleprompterOpen, setTeleprompterOpen,
     recognizedUpTo, setRecognizedUpTo,
+    jumpToParagraph, jumpToPosition,
+    timerMode, countdownTarget,
+    events, recordingStartTime, beforeRewindPos, addEvent, clearEvents,
     settings, updateSettings,
   } = useTeleprompterStore();
 
@@ -172,6 +239,13 @@ export function Teleprompter() {
   const [isFullscreen, setIsFullscreen] = useState(false);
   const userScrollingRef = useRef(false);
   const userScrollTimerRef = useRef<ReturnType<typeof setTimeout>>(null);
+
+  // ── Timer state ──
+  const [elapsed, setElapsed] = useState(0); // ms
+  const timerIntervalRef = useRef<ReturnType<typeof setInterval>>(null);
+  const [countdownAlert, setCountdownAlert] = useState(false);
+  // 3-2-1 countdown overlay
+  const [countdownOverlay, setCountdownOverlay] = useState<number | null>(null);
 
   // ── Dynamic speech language based on current reading position ──
   const currentSpeechLang = (() => {
@@ -204,29 +278,58 @@ export function Teleprompter() {
   const { isListening, isSupported, startListening, stopListening, resetTranscript } = useSpeechRecognition({ lang: currentSpeechLang, onResult: onSpeechResult });
 
   // ── Restart recognition when speech language changes ──
-  // Since startListening now reads lang from a ref internally, we only need to
-  // restart recognition so it picks up the new language for the next session.
   useEffect(() => {
     if (currentSpeechLangRef.current === currentSpeechLang) return;
     currentSpeechLangRef.current = currentSpeechLang;
     if (isListening) {
-      // startListening already stops any existing instance and creates a fresh one
-      // with the latest lang from langRef, so no need for stopListening first.
       const timer = setTimeout(() => startListening(), 150);
       return () => clearTimeout(timer);
     }
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [currentSpeechLang]);
 
+  // ── Timer tick (always runs once started — must stay in sync with real recording) ──
+  useEffect(() => {
+    if (recordingStartTime > 0) {
+      timerIntervalRef.current = setInterval(() => {
+        const now = Date.now();
+        const ms = now - recordingStartTime;
+        setElapsed(ms);
+        // Countdown alert
+        if (timerMode === "countdown") {
+          const remaining = countdownTarget * 1000 - ms;
+          if (remaining <= 0 && !countdownAlert) {
+            setCountdownAlert(true);
+          }
+        }
+      }, 200);
+      return () => { if (timerIntervalRef.current) clearInterval(timerIntervalRef.current); };
+    } else {
+      if (timerIntervalRef.current) clearInterval(timerIntervalRef.current);
+    }
+  }, [recordingStartTime, timerMode, countdownTarget, countdownAlert]);
+
+  // ── Recover detection: when position passes the pre-rewind position ──
+  useEffect(() => {
+    if (beforeRewindPos > 0 && recognizedUpTo >= beforeRewindPos) {
+      addEvent("recover", recognizedUpTo);
+      useTeleprompterStore.setState({ beforeRewindPos: -1 });
+    }
+  }, [recognizedUpTo, beforeRewindPos, addEvent]);
+
   // ── Handlers ──
   const handleClose = useCallback(() => {
+    if (isPlaying) {
+      addEvent("end", Math.max(0, recognizedUpToRef.current));
+    }
     setIsPlaying(false);
     stopListening();
     setTeleprompterOpen(false);
     setSettingsOpen(false);
+    setCountdownAlert(false);
     if (document.fullscreenElement) document.exitFullscreen().catch(() => {});
     if (window.history.state?.teleprompter) window.history.back();
-  }, [setIsPlaying, stopListening, setTeleprompterOpen]);
+  }, [setIsPlaying, stopListening, setTeleprompterOpen, addEvent, isPlaying]);
 
   // Browser history
   useEffect(() => {
@@ -237,14 +340,112 @@ export function Teleprompter() {
     return () => window.removeEventListener("popstate", onPop);
   }, [isTeleprompterOpen, setIsPlaying, stopListening, setTeleprompterOpen]);
 
+  // ── Play/pause with event recording & 3-2-1 countdown ──
+  const handleTogglePlay = useCallback(() => {
+    const store = useTeleprompterStore.getState();
+    if (!store.isPlaying) {
+      // Starting — show 3-2-1 countdown
+      setCountdownOverlay(3);
+      let count = 3;
+      const interval = setInterval(() => {
+        count--;
+        if (count > 0) {
+          setCountdownOverlay(count);
+        } else {
+          clearInterval(interval);
+          setCountdownOverlay(null);
+
+          // Play sync beep — this sound is picked up by the phone's mic
+          // so AI can find the exact time-zero in the recording audio.
+          try {
+            const audioCtx = new (window.AudioContext || (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext)();
+            const oscillator = audioCtx.createOscillator();
+            const gain = audioCtx.createGain();
+            oscillator.connect(gain);
+            gain.connect(audioCtx.destination);
+            oscillator.frequency.value = 1000; // 1kHz tone — easy to detect
+            oscillator.type = "sine";
+            gain.gain.value = 0.5;
+            oscillator.start();
+            // Short beep: 150ms
+            oscillator.stop(audioCtx.currentTime + 0.15);
+            // Clean up after beep
+            setTimeout(() => audioCtx.close(), 300);
+          } catch {
+            // Audio not available — continue silently
+          }
+
+          // Actually start
+          const now = Date.now();
+          if (store.recordingStartTime === 0) {
+            useTeleprompterStore.setState({ recordingStartTime: now });
+          }
+          addEvent("start", Math.max(0, store.recognizedUpTo));
+          setElapsed(now - (store.recordingStartTime || now));
+          setCountdownAlert(false);
+          togglePlaying();
+        }
+      }, 1000);
+    } else {
+      // Pausing
+      addEvent("pause", Math.max(0, store.recognizedUpTo));
+      togglePlaying();
+    }
+  }, [togglePlaying, addEvent]);
+
   const handleReset = useCallback(() => {
+    if (isPlaying) {
+      addEvent("end", Math.max(0, recognizedUpToRef.current));
+    }
     setIsPlaying(false);
     stopListening();
     setRecognizedUpTo(-1);
     resetTranscript();
     allRecognizedRef.current = "";
+    setElapsed(0);
+    setCountdownAlert(false);
+    clearEvents();
     if (containerRef.current) containerRef.current.scrollTo({ top: 0, behavior: "smooth" });
-  }, [setIsPlaying, stopListening, setRecognizedUpTo, resetTranscript]);
+  }, [setIsPlaying, stopListening, setRecognizedUpTo, resetTranscript, addEvent, clearEvents, isPlaying]);
+
+  // ── Click-to-reposition handler (records rewind event) ──
+  const handleClickReposition = useCallback((charIndex: number) => {
+    const currentPos = recognizedUpToRef.current;
+    if (charIndex < currentPos && recordingStartTime > 0) {
+      // Going backward — this is a rewind
+      addEvent("rewind", charIndex, currentPos);
+      useTeleprompterStore.setState({ beforeRewindPos: currentPos });
+    }
+    jumpToPosition(charIndex);
+    recognizedUpToRef.current = charIndex;
+    allRecognizedRef.current = "";
+  }, [jumpToPosition, addEvent, recordingStartTime]);
+
+  // ── Sentence jump handlers (records rewind if going backward) ──
+  const handlePrevParagraph = useCallback(() => {
+    const currentPos = Math.max(0, recognizedUpToRef.current);
+    jumpToParagraph("prev");
+    const newPos = useTeleprompterStore.getState().recognizedUpTo;
+    recognizedUpToRef.current = newPos;
+    allRecognizedRef.current = "";
+    if (newPos < currentPos && recordingStartTime > 0) {
+      addEvent("rewind", newPos, currentPos);
+      useTeleprompterStore.setState({ beforeRewindPos: currentPos });
+    }
+  }, [jumpToParagraph, addEvent, recordingStartTime]);
+
+  const handleNextParagraph = useCallback(() => {
+    jumpToParagraph("next");
+    const newPos = useTeleprompterStore.getState().recognizedUpTo;
+    recognizedUpToRef.current = newPos;
+    allRecognizedRef.current = "";
+  }, [jumpToParagraph]);
+
+  // ── Export handler ──
+  const handleExport = useCallback(() => {
+    const content = toEditJSON(events);
+    downloadFile(content, "teleprompt-edit-log.json");
+  }, [events]);
 
   const toggleFullscreen = useCallback(() => {
     if (document.fullscreenElement) document.exitFullscreen().catch(() => {});
@@ -322,14 +523,16 @@ export function Teleprompter() {
   useEffect(() => {
     if (!isTeleprompterOpen) return;
     const handler = (e: KeyboardEvent) => {
-      if (e.code === "Space") { e.preventDefault(); togglePlaying(); }
+      if (e.code === "Space") { e.preventDefault(); handleTogglePlay(); }
       else if (e.key === "Escape") handleClose();
+      else if (e.key === "ArrowLeft") { e.preventDefault(); handlePrevParagraph(); }
+      else if (e.key === "ArrowRight") { e.preventDefault(); handleNextParagraph(); }
       else if (e.key === "ArrowUp" && !isFollowMode) { e.preventDefault(); updateSettings({ scrollSpeed: Math.max(20, settings.scrollSpeed - 10) }); }
       else if (e.key === "ArrowDown" && !isFollowMode) { e.preventDefault(); updateSettings({ scrollSpeed: Math.min(200, settings.scrollSpeed + 10) }); }
     };
     window.addEventListener("keydown", handler);
     return () => window.removeEventListener("keydown", handler);
-  }, [isTeleprompterOpen, isFollowMode, settings.scrollSpeed, togglePlaying, handleClose, updateSettings]);
+  }, [isTeleprompterOpen, isFollowMode, settings.scrollSpeed, handleTogglePlay, handleClose, updateSettings, handlePrevParagraph, handleNextParagraph]);
 
   // ── Controls auto-hide ──
   useEffect(() => {
@@ -359,7 +562,7 @@ export function Teleprompter() {
       <div ref={containerRef} className="absolute inset-0 overflow-y-auto scrollbar-hide" style={{ transform: isMirrored ? "scaleX(-1)" : undefined }}>
         <div className="mx-auto max-w-4xl px-5 sm:px-12" style={{ paddingTop: "35vh", paddingBottom: "60vh", lineHeight, fontWeight: 500, wordBreak: "break-word" }}>
           <div className="teleprompter-text" style={{ fontSize: `${fontSize}px` }}>
-            <TextDisplay text={text} recognizedUpTo={recognizedUpTo} textColor={textColor} highlightColor={highlightColor} highlightRef={highlightBoundaryRef} />
+            <TextDisplay text={text} recognizedUpTo={recognizedUpTo} textColor={textColor} highlightColor={highlightColor} highlightRef={highlightBoundaryRef} onClickPosition={handleClickReposition} />
           </div>
         </div>
       </div>
@@ -368,7 +571,27 @@ export function Teleprompter() {
       <div className="pointer-events-none fixed top-0 left-0 right-0 h-24 sm:h-32 z-[51]" style={{ background: `linear-gradient(to bottom, ${backgroundColor}, transparent)` }} />
       <div className="pointer-events-none fixed bottom-0 left-0 right-0 h-24 sm:h-32 z-[51]" style={{ background: `linear-gradient(to top, ${backgroundColor}, transparent)` }} />
 
-      {/* Top indicators */}
+      {/* Timer — always visible once recording has started */}
+      {recordingStartTime > 0 && (
+        <div className="fixed top-3 sm:top-4 right-4 sm:right-6 z-[53] select-none">
+          <div className={cn(
+            "flex items-center gap-1.5 px-3 py-1.5 rounded-full text-sm font-mono border",
+            timerMode === "countdown" && countdownAlert
+              ? "bg-red-500/20 border-red-500/50 text-red-400 animate-pulse"
+              : "bg-black/60 backdrop-blur-sm border-white/20 text-white/90"
+          )}>
+            {timerMode === "countdown" ? <Clock size={13} /> : <Timer size={13} />}
+            <span>
+              {timerMode === "countdown"
+                ? formatTimer(Math.max(0, countdownTarget * 1000 - elapsed))
+                : formatTimer(elapsed)
+              }
+            </span>
+          </div>
+        </div>
+      )}
+
+      {/* Top indicators (auto-hide with controls) */}
       <div className={cn("fixed top-3 sm:top-4 left-1/2 -translate-x-1/2 z-[52] flex items-center gap-2 select-none transition-all duration-300", controlsVisible ? "opacity-100 translate-y-0" : "opacity-0 -translate-y-4 pointer-events-none")}>
         {isMirrored && (
           <div className="flex items-center gap-1.5 px-2.5 py-1 rounded-full bg-[#00ff88]/15 border border-[#00ff88]/30 text-[#00ff88] text-xs">
@@ -393,13 +616,19 @@ export function Teleprompter() {
         <div className="bg-black/85 backdrop-blur-md border border-white/10 rounded-xl p-2.5 sm:px-4 sm:py-3">
           <div className="flex items-center justify-between gap-1 sm:gap-2">
             <div className="flex items-center gap-1">
-              <CtrlBtn icon={isPlaying ? <Pause size={18} /> : <Play size={18} />} onClick={togglePlaying} label={isPlaying ? t.pause : t.play} />
+              <CtrlBtn icon={isPlaying ? <Pause size={18} /> : <Play size={18} />} onClick={handleTogglePlay} label={isPlaying ? t.pause : t.play} />
               <CtrlBtn icon={<RotateCcw size={16} />} onClick={handleReset} label={t.reset} />
+              <CtrlBtn icon={<SkipBack size={16} />} onClick={handlePrevParagraph} label={t.prevParagraph} />
+              <CtrlBtn icon={<SkipForward size={16} />} onClick={handleNextParagraph} label={t.nextParagraph} />
             </div>
 
             <ModeToggle mode={settings.scrollMode} onChange={(m) => updateSettings({ scrollMode: m })} />
 
             <div className="flex items-center gap-1">
+              {/* Export button — only show when there are rewind events and paused */}
+              {events.length > 0 && !isPlaying && hasRewinds(events) && (
+                <CtrlBtn icon={<Download size={16} />} onClick={handleExport} label={t.download} />
+              )}
               {!isFollowMode && (
                 <CtrlBtn icon={isListening ? <Mic size={16} className="text-green-400" /> : <MicOff size={16} />} onClick={() => updateSettings({ speechRecognitionEnabled: !settings.speechRecognitionEnabled })} active={settings.speechRecognitionEnabled} />
               )}
@@ -422,6 +651,24 @@ export function Teleprompter() {
           )}
         </div>
       </div>
+
+      {/* 3-2-1 Countdown overlay */}
+      {countdownOverlay !== null && (
+        <div className="fixed inset-0 z-[60] flex items-center justify-center pointer-events-none">
+          <div className="text-[120px] sm:text-[180px] font-bold text-white/90 animate-ping" style={{ animationDuration: "0.8s" }}>
+            {countdownOverlay}
+          </div>
+        </div>
+      )}
+
+      {/* Countdown alert flash */}
+      {countdownAlert && isPlaying && (
+        <div className="fixed top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 z-[55] pointer-events-none">
+          <div className="px-6 py-3 rounded-xl bg-red-500/20 border border-red-500/40 text-red-400 text-lg font-bold animate-bounce">
+            {t.countdownDone}
+          </div>
+        </div>
+      )}
 
       <SettingsPanel open={settingsOpen} onClose={() => setSettingsOpen(false)} />
 
