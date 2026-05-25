@@ -3,6 +3,7 @@
 import { create } from "zustand";
 import { persist } from "zustand/middleware";
 import { getTemplates } from "./templates";
+import type { TeleprompterEvent } from "./export-utils";
 
 function getDefaultText(): string {
   const tpls = getTemplates();
@@ -59,6 +60,65 @@ const defaultSettings: TeleprompterSettings = {
   lineHeight: 1.8,
 };
 
+// ── Sentence/clause break helpers ────────────────────────────────────────
+/** Compute break positions based on ALL common punctuation marks.
+ *  Includes: ，、。！？!?.,;；：:…—and also \n\n (paragraph breaks).
+ *  Returns indices pointing to the START of each clause/sentence. */
+export function computeParagraphBreaks(text: string): number[] {
+  const breaks: number[] = [0]; // Always include start of text
+  // Match all common Chinese + English punctuation and paragraph breaks
+  // Chinese: ，、。！？；：…—
+  // English: , . ! ? ; : -
+  // Also: ellipsis (……/...) and paragraph breaks (\n\n)
+  const regex = /[，、。！？；：…—,\.!?;:\-]+|\n\n+/g;
+  let match;
+  while ((match = regex.exec(text)) !== null) {
+    // Position right after the punctuation (start of next clause)
+    let nextStart = match.index + match[0].length;
+    // Skip any trailing whitespace/newlines after the punctuation
+    while (nextStart < text.length && /[\s\n]/.test(text[nextStart])) {
+      nextStart++;
+    }
+    if (nextStart < text.length && (breaks.length === 0 || breaks[breaks.length - 1] !== nextStart)) {
+      breaks.push(nextStart);
+    }
+  }
+  return breaks;
+}
+
+/** Find the start of the paragraph containing `pos` */
+export function getParagraphStart(breaks: number[], pos: number): number {
+  let start = 0;
+  for (const b of breaks) {
+    if (b <= pos) start = b;
+    else break;
+  }
+  return start;
+}
+
+/** Find the start of the previous paragraph relative to `pos` */
+export function getPrevParagraphStart(breaks: number[], pos: number): number {
+  const currentStart = getParagraphStart(breaks, pos);
+  // If we're already at the start of a paragraph, go to the previous one
+  let prev = 0;
+  for (const b of breaks) {
+    if (b < currentStart) prev = b;
+    else break;
+  }
+  return prev;
+}
+
+/** Find the start of the next paragraph relative to `pos` */
+export function getNextParagraphStart(breaks: number[], pos: number): number {
+  for (const b of breaks) {
+    if (b > pos) return b;
+  }
+  return pos; // Already at or past the last paragraph
+}
+
+// ── Timer types ──────────────────────────────────────────────
+export type TimerMode = "stopwatch" | "countdown";
+
 // ── Store ────────────────────────────────────────────────────
 interface TeleprompterState {
   // Simple mode text
@@ -80,6 +140,28 @@ interface TeleprompterState {
   // Current reading position
   recognizedUpTo: number;
   setRecognizedUpTo: (index: number) => void;
+
+  // Sentence break points (cached)
+  paragraphBreaks: number[];
+
+  // Jump to prev/next sentence
+  jumpToParagraph: (direction: "prev" | "next") => void;
+
+  // Jump to arbitrary position (e.g. click-to-reposition)
+  jumpToPosition: (pos: number) => void;
+
+  // Timer
+  timerMode: TimerMode;
+  setTimerMode: (mode: TimerMode) => void;
+  countdownTarget: number; // seconds
+  setCountdownTarget: (seconds: number) => void;
+
+  // Event log for editing
+  events: TeleprompterEvent[];
+  recordingStartTime: number; // Date.now() when recording started
+  beforeRewindPos: number; // position before last rewind (for recover detection)
+  addEvent: (type: TeleprompterEvent["type"], textPosition: number, beforePosition?: number) => void;
+  clearEvents: () => void;
 
   // Settings
   settings: TeleprompterSettings;
@@ -106,11 +188,14 @@ export const useTeleprompterStore = create<TeleprompterState>()(
         if (isTeleprompterOpen) {
           const { text } = get();
           if (text.trim()) {
-            // Convert text to a single section for playback
             set({
               sections: [createSection({ title: "", content: text })],
               recognizedUpTo: -1,
               isTeleprompterOpen,
+              paragraphBreaks: computeParagraphBreaks(text),
+              events: [],
+              recordingStartTime: 0,
+              beforeRewindPos: -1,
             });
             return;
           }
@@ -120,6 +205,46 @@ export const useTeleprompterStore = create<TeleprompterState>()(
 
       recognizedUpTo: -1,
       setRecognizedUpTo: (recognizedUpTo) => set({ recognizedUpTo }),
+
+      paragraphBreaks: [],
+
+      jumpToParagraph: (direction) => {
+        const { recognizedUpTo, paragraphBreaks } = get();
+        const pos = Math.max(0, recognizedUpTo);
+        const newPos = direction === "prev"
+          ? getPrevParagraphStart(paragraphBreaks, pos)
+          : getNextParagraphStart(paragraphBreaks, pos);
+        set({ recognizedUpTo: newPos });
+      },
+
+      jumpToPosition: (pos) => {
+        set({ recognizedUpTo: Math.max(0, pos) });
+      },
+
+      // Timer
+      timerMode: "stopwatch",
+      setTimerMode: (timerMode) => set({ timerMode }),
+      countdownTarget: 60,
+      setCountdownTarget: (countdownTarget) => set({ countdownTarget }),
+
+      // Event log
+      events: [],
+      recordingStartTime: 0,
+      beforeRewindPos: -1,
+      addEvent: (type, textPosition, beforePosition) => {
+        const { recordingStartTime, events } = get();
+        const now = Date.now();
+        const timestamp = recordingStartTime > 0 ? now - recordingStartTime : 0;
+        const event: TeleprompterEvent = {
+          type,
+          timestamp,
+          wallClock: new Date(now).toISOString(),
+          textPosition,
+          ...(beforePosition !== undefined && { beforePosition }),
+        };
+        set({ events: [...events, event] });
+      },
+      clearEvents: () => set({ events: [], recordingStartTime: 0, beforeRewindPos: -1 }),
 
       settings: defaultSettings,
       updateSettings: (partial) =>
@@ -131,6 +256,9 @@ export const useTeleprompterStore = create<TeleprompterState>()(
         set({
           isPlaying: false,
           recognizedUpTo: -1,
+          events: [],
+          recordingStartTime: 0,
+          beforeRewindPos: -1,
         }),
     }),
     {

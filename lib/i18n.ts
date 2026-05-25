@@ -77,6 +77,13 @@ const translations = {
     multiMode: "Multi-Card",
     simpleDesc: "Paste a single script and start reading",
     multiDesc: "Organize multiple sections for livestream",
+    prevParagraph: "Prev Sentence",
+    nextParagraph: "Next Sentence",
+    timerStopwatch: "Stopwatch",
+    timerCountdown: "Countdown",
+    countdownDone: "Time's up!",
+    countdownReady: "Ready?",
+    download: "Download Edit Log",
   },
   zh: {
     appTitle: "TelePrompt",
@@ -152,6 +159,13 @@ const translations = {
     multiMode: "多卡片模式",
     simpleDesc: "粘贴单段文稿直接阅读",
     multiDesc: "组织多个段落用于直播",
+    prevParagraph: "上一句",
+    nextParagraph: "下一句",
+    timerStopwatch: "正计时",
+    timerCountdown: "倒计时",
+    countdownDone: "时间到！",
+    countdownReady: "准备好了吗？",
+    download: "下载剪辑日志",
   },
 } as const;
 
